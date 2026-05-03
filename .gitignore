@@ -1,0 +1,15 @@
+# Virtual Environment (The cause of your 100MB error)
+.venv312/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment variables (To keep your Reddit Secret safe)
+.env
+
+# Large model files (If you download FinBERT weights locally)
+*.bin
+*.pt

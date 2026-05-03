@@ -1,0 +1,10 @@
+fastapi
+pandas
+pydantic
+psycopg[binary]
+psycopg-pool
+praw
+transformers
+uvicorn
+yfinance
+xgboost
