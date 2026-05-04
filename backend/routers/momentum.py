@@ -1,38 +1,15 @@
-"""
-routers/momentum.py
-
-/api/v1/momentum/{ticker}  — the core analytical endpoint.
-
-Architecture decision: the heavy lifting is done in a single, optimised
-SQL query using CTEs rather than pulling raw rows into Python for aggregation.
-This keeps network traffic low and leverages PostgreSQL's window functions.
-"""
 from __future__ import annotations
-
-import math
 from datetime import date, timedelta
 from typing import Annotated
-
 from fastapi import APIRouter, HTTPException, Query
 from psycopg.rows import dict_row
-
-from ..database import get_db
-from ..schemas import DailyMomentumPoint, MomentumResponse, MomentumSummary
+from ..database import db_conn
+from ..schemas import Point, Response, Summary
 
 router = APIRouter(tags=["momentum"])
 
-# ------------------------------------------------------------------
-# Core SQL — composite CTE that merges price + rolling sentiment.
-#
-# Why raw SQL instead of an ORM:
-#   • Window functions (LAG, rolling AVG OVER …) are idiomatic SQL.
-#   • CTEs keep each concern isolated and readable.
-#   • Zero N+1 queries — everything is one round-trip.
-# ------------------------------------------------------------------
-
-_MOMENTUM_SQL = """
+MNT_SQL = """
 WITH
--- ── 1. Aggregate intraday price to daily OHLCV ──────────────────
 daily_price_raw AS (
     SELECT
         DATE(ts AT TIME ZONE 'Asia/Kolkata') AS trade_date,
@@ -47,7 +24,6 @@ daily_price_raw AS (
       AND ts < (%(end_date)s::DATE + INTERVAL '1 day')::TIMESTAMPTZ
     GROUP BY DATE(ts AT TIME ZONE 'Asia/Kolkata')
 ),
-
 price_data AS (
     SELECT
         trade_date,
@@ -67,8 +43,6 @@ price_data AS (
         ) AS pct_change
     FROM daily_price_raw
 ),
-
--- ── 2. Daily sentiment aggregates ───────────────────────────────
 sentiment_daily AS (
     SELECT
         DATE(created_at AT TIME ZONE 'Asia/Kolkata')                              AS sentiment_date,
@@ -84,8 +58,6 @@ sentiment_daily AS (
       AND created_at <  (%(end_date)s::DATE + INTERVAL '1 day')::TIMESTAMPTZ
     GROUP BY DATE(created_at AT TIME ZONE 'Asia/Kolkata')
 ),
-
--- ── 3. 7-day rolling windows on sentiment ───────────────────────
 rolling_sentiment AS (
     SELECT
         sentiment_date,
@@ -108,8 +80,6 @@ rolling_sentiment AS (
         )                  AS rolling_7d_mentions
     FROM sentiment_daily
 ),
-
--- ── 4. Final join ────────────────────────────────────────────────
 joined_data AS (
     SELECT
         p.trade_date,
@@ -137,82 +107,56 @@ FROM joined_data
 ORDER BY trade_date ASC
 """
 
-
-# ------------------------------------------------------------------
-# Endpoint
-# ------------------------------------------------------------------
-
 @router.get(
     "/momentum/{ticker}",
-    response_model=MomentumResponse,
-    summary="7-day rolling sentiment × price momentum for a ticker",
+    response_model=Response,
+    summary="7d rolling sentiment x price mnt",
 )
-async def get_momentum(
+async def fetch(
     ticker: str,
-    days:     Annotated[int, Query(ge=7, le=365, description="Look-back window in trading days")] = 30,
-    end_date: Annotated[date | None, Query(description="Inclusive end date (defaults to today)")] = None,
-) -> MomentumResponse:
-    ticker  = ticker.strip().upper()
-    _end    = end_date or date.today()
-    _start  = _end - timedelta(days=days)
+    days: Annotated[int, Query(ge=7, le=365)] = 30,
+    end_date: Annotated[date | None, Query()] = None,
+) -> Response:
+    ticker = ticker.strip().upper()
+    _end = end_date or date.today()
+    _start = _end - timedelta(days=days)
 
-    async with get_db() as conn:
-        # ── Verify the ticker is registered ──────────────────────
+    async with db_conn() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 "SELECT id, company_name, sector FROM assets WHERE ticker = %s",
                 (ticker,),
             )
-            asset_row = await cur.fetchone()
+            asset = await cur.fetchone()
 
-        if not asset_row:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Ticker '{ticker}' not found. Ingest it first via the pipeline.",
-            )
+        if not asset:
+            raise HTTPException(404, f"ticker {ticker} not found")
 
-        # ── Execute the composite query ───────────────────────────
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                _MOMENTUM_SQL,
+                MNT_SQL,
                 {"ticker": ticker, "start_date": _start, "end_date": _end},
             )
             rows = await cur.fetchall()
 
     if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No price history found for {ticker} "
-                f"between {_start} and {_end}. "
-                "Run the ingestion pipeline to populate data."
-            ),
-        )
+        raise HTTPException(404, "no data found")
 
-    # ── Deserialise rows → Pydantic models ────────────────────────
-    data_points = [DailyMomentumPoint(**r) for r in rows]
+    points = [Point(**r) for r in rows]
+    sent_series = [d.daily_sentiment for d in points if d.mention_count > 0]
+    pct_changes = [d.pct_change for d in points if d.pct_change != 0.0]
 
-    # ── Compute summary statistics ────────────────────────────────
-    sentiment_series = [d.daily_sentiment for d in data_points if d.mention_count > 0]
-    pct_changes      = [d.pct_change      for d in data_points if d.pct_change != 0.0]
-
-    summary = MomentumSummary(
+    summary = Summary(
         ticker=ticker,
-        company_name=asset_row["company_name"],
-        sector=asset_row["sector"],
+        company_name=asset["company_name"],
+        sector=asset["sector"],
         period_start=_start,
         period_end=_end,
-        avg_sentiment=(
-            round(sum(sentiment_series) / len(sentiment_series), 5)
-            if sentiment_series else 0.0
-        ),
-        total_mentions=sum(d.mention_count for d in data_points),
-        price_momentum=(
-            round(sum(pct_changes) / len(pct_changes), 5)
-            if pct_changes else 0.0
-        ),
-        latest_close=data_points[-1].close if data_points else 0.0,
+        avg_sentiment=(sum(sent_series) / len(sent_series) if sent_series else 0.0),
+        total_mentions=sum(d.mention_count for d in points),
+        price_momentum=(sum(pct_changes) / len(pct_changes) if pct_changes else 0.0),
+        latest_close=points[-1].close if points else 0.0,
         sentiment_price_correlation=float(rows[0]["sentiment_price_correlation"]),
     )
 
-    return MomentumResponse(summary=summary, data=data_points)
+    return Response(summary=summary, data=points)

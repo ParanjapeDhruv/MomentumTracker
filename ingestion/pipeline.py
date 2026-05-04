@@ -1,21 +1,4 @@
-"""
-ingestion/pipeline.py — Standalone data-ingestion script.
-
-Responsibilities:
-  1. Fetch OHLCV history via yfinance  →  price_history table
-  2. Fetch Yahoo Finance News          →  run FinBERT  →  sentiment_logs table
-
-Rate-limit handling strategy:
-  • yfinance: No hard rate limit, but we add a polite inter-request delay and
-              retry with exponential back-off on HTTP 429.
-  • FinBERT: Local inference — no external rate limit, but we batch inputs to
-             control GPU/CPU memory.
-
-Run:
-    TICKERS=AAPL,TSLA,NVDA python -m ingestion.pipeline
-"""
 from __future__ import annotations
-
 import hashlib
 import importlib
 import logging
@@ -24,400 +7,175 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
 import psycopg
 import yfinance as yf
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
 IST = ZoneInfo("Asia/Kolkata")
-
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-_DATABASE_URL = os.environ.get(
+_DB_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://postgres:postgres@localhost:5432/sentiment_tracker",
 )
 
-# ------------------------------------------------------------------
-# Sentiment result container
-# ------------------------------------------------------------------
-
 @dataclass(slots=True, frozen=True)
-class SentimentResult:
-    positive: float   # FinBERT softmax probability for "positive"
-    negative: float   # FinBERT softmax probability for "negative"
-    neutral:  float   # FinBERT softmax probability for "neutral"
-    compound: float   # Derived: positive - negative  ∈ [-1, 1]
+class Score:
+    positive: float
+    negative: float
+    neutral: float
+    compound: float
 
-
-# ------------------------------------------------------------------
-# FinBERT wrapper
-# ------------------------------------------------------------------
-
-class FinBERTAnalyzer:
-    """
-    Wraps ProsusAI/finbert for single and batch inference.
-
-    FinBERT label mapping (from model card):
-        LABEL_0 → positive
-        LABEL_1 → negative
-        LABEL_2 → neutral
-
-    Compound score = P(positive) − P(negative), which is a crisp
-    directional float in [−1, 1] suitable for time-series aggregation.
-    """
-
+class FinBERT:
     MODEL_ID = "ProsusAI/finbert"
-    # FinBERT was trained on financial texts up to 512 tokens.
     MAX_TOKENS = 512
 
     def __init__(self) -> None:
-        logger.info("Loading FinBERT from %s …", self.MODEL_ID)
+        logger.info("loading finbert")
         tokenizer = AutoTokenizer.from_pretrained(self.MODEL_ID)
         model = AutoModelForSequenceClassification.from_pretrained(self.MODEL_ID)
-
-        # pipeline() handles device placement automatically.
         self._pipe = pipeline(
             task="text-classification",
             model=model,
             tokenizer=tokenizer,
-            top_k=None,  # Return all scores
+            top_k=None,
             truncation=True,
             max_length=self.MAX_TOKENS,
-            # device=0 for GPU; -1 forces CPU.  Auto-detect:
-            device=_get_device_id(),
+            device=self._get_dev(),
         )
-        logger.info("FinBERT ready.")
 
-    # ------------------------------------------------------------------
+    def _get_dev(self) -> int:
+        try:
+            torch = importlib.import_module("torch")
+            return 0 if torch.cuda.is_available() else -1
+        except ImportError:
+            return -1
 
-    def _parse_scores(self, raw_output: list[dict] | dict) -> SentimentResult:
-        """Helper to extract scores from various pipeline output formats."""
-        # If output is a single dict (some pipeline configs), wrap it
-        items = raw_output if isinstance(raw_output, list) else [raw_output]
-        
+    def _parse(self, raw: list[dict] | dict) -> Score:
+        items = raw if isinstance(raw, list) else [raw]
         scores = {item["label"].lower(): float(item["score"]) for item in items}
-        pos = scores.get("positive", 0.0)
-        neg = scores.get("negative", 0.0)
-        neu = scores.get("neutral",  0.0)
+        pos, neg, neu = scores.get("positive", 0.0), scores.get("negative", 0.0), scores.get("neutral", 0.0)
+        return Score(round(pos, 5), round(neg, 5), round(neu, 5), round(pos - neg, 5))
 
-        return SentimentResult(
-            positive=round(pos, 5),
-            negative=round(neg, 5),
-            neutral= round(neu, 5),
-            compound=round(pos - neg, 5),
-        )
-
-    def analyze(self, text: str) -> SentimentResult:
-        """Single-item inference.  Returns neutral(0) for empty/short text."""
-        text = text.strip()
-        if len(text) < 15:
-            return SentimentResult(0.0, 0.0, 1.0, 0.0)
-
+    def score(self, text: str) -> Score:
+        if len(text.strip()) < 15: return Score(0.0, 0.0, 1.0, 0.0)
         try:
-            raw = self._pipe(text)
-            # Pipeline for single text usually returns [[{...}, ...]] or [{...}, ...]
-            return self._parse_scores(raw[0] if isinstance(raw, list) else raw)
-        except Exception as exc:
-            logger.warning("FinBERT inference failed: %s", exc)
-            return SentimentResult(0.0, 0.0, 1.0, 0.0)
+            raw = self._pipe(text.strip())
+            return self._parse(raw[0] if isinstance(raw, list) else raw)
+        except Exception:
+            return Score(0.0, 0.0, 1.0, 0.0)
 
-    def analyze_batch(self, texts: list[str]) -> list[SentimentResult]:
-        """
-        Batch inference.  Skips empty texts and returns neutral placeholders.
-        Falls back to single-item inference on any batch error.
-        """
-        if not texts:
-            return []
-            
+    def score_batch(self, texts: list[str]) -> list[Score]:
+        if not texts: return []
         try:
-            raw_batch = self._pipe(
-                [t[:2000] for t in texts],  # hard-cap chars to avoid OOM
-                batch_size=16,
-            )
-            # raw_batch is usually [[{...}, ...], ...]
-            return [self._parse_scores(raw) for raw in raw_batch]
-        except Exception as exc:
-            logger.warning("Batch inference failed (%s), falling back to single.", exc)
-            return [self.analyze(t) for t in texts]
+            raw = self._pipe([t[:2000] for t in texts], batch_size=16)
+            return [self._parse(r) for r in raw]
+        except Exception:
+            return [self.score(t) for t in texts]
 
-
-# ------------------------------------------------------------------
-# Token-bucket rate limiter (simple, no external deps)
-# ------------------------------------------------------------------
-
-class RateLimiter:
-    """Ensures at most `calls_per_minute` API calls per minute."""
-
-    def __init__(self, calls_per_minute: int) -> None:
-        self._interval = 60.0 / calls_per_minute
-        self._last     = 0.0
+class Limiter:
+    def __init__(self, cpm: int) -> None:
+        self._int = 60.0 / cpm
+        self._last = 0.0
 
     def wait(self) -> None:
         elapsed = time.monotonic() - self._last
-        if elapsed < self._interval:
-            time.sleep(self._interval - elapsed)
+        if elapsed < self._int:
+            time.sleep(self._int - elapsed)
         self._last = time.monotonic()
 
-
-# ------------------------------------------------------------------
-# Exponential back-off decorator
-# ------------------------------------------------------------------
-
-def with_exponential_backoff(
-    func,
-    *args,
-    max_retries: int = 5,
-    base_delay:  float = 1.0,
-    **kwargs,
-):
-    """
-    Call func(*args, **kwargs), retrying on Exception up to max_retries times.
-    Delay doubles each attempt: 1s, 2s, 4s, 8s, 16s.
-    """
-    for attempt in range(max_retries):
+def retry(func, *args, retries=5, delay=1.0, **kwargs):
+    for i in range(retries):
         try:
             return func(*args, **kwargs)
-        except Exception as exc:
-            if attempt == max_retries - 1:
-                raise
-            delay = base_delay * (2 ** attempt)
-            logger.warning(
-                "Attempt %d/%d failed (%s). Retrying in %.1fs …",
-                attempt + 1, max_retries, exc, delay,
-            )
-            time.sleep(delay)
+        except Exception as e:
+            if i == retries - 1: raise
+            t = delay * (2 ** i)
+            logger.warning("retry %d/%d: %s", i+1, retries, e)
+            time.sleep(t)
 
-
-# ------------------------------------------------------------------
-# yfinance: fetch and upsert OHLCV
-# ------------------------------------------------------------------
-
-def fetch_and_store_price_history(
-    ticker: str,
-    conn:   psycopg.Connection,
-    period: str = "60d",
-) -> int:
-    """
-    Download OHLCV history for `ticker` and upsert into price_history.
-    Phase 3: Fetches high-frequency 5m intervals instead of daily.
-    """
-    logger.info("[%s] Fetching price history (period=%s, interval=5m) …", ticker, period)
-
-    def _download():
-        stock = yf.Ticker(ticker)
-        hist  = stock.history(period=period, interval="5m", auto_adjust=True)
-        info  = {}
-        try:
-            info = stock.info  # may fail for delisted tickers
-        except Exception:
-            pass
-        return hist, info
-
-    hist, info = with_exponential_backoff(_download, max_retries=4, base_delay=2.0)
-
-    if hist.empty:
-        logger.warning("[%s] yfinance returned empty DataFrame.", ticker)
-        return 0
-
-    # Ensure asset row exists
+def ingest_ohlcv(ticker: str, conn: psycopg.Connection, period: str = "60d") -> int:
+    logger.info("[%s] ingest ohlcv", ticker)
+    def _fetch():
+        s = yf.Ticker(ticker)
+        return s.history(period=period, interval="5m", auto_adjust=True), s.info
+    hist, info = retry(_fetch)
+    if hist.empty: return 0
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO assets (ticker, company_name, sector, market_cap)
             VALUES (%s, %s, %s, %s)
-            ON CONFLICT (ticker)
-            DO UPDATE SET
+            ON CONFLICT (ticker) DO UPDATE SET
                 company_name = EXCLUDED.company_name,
-                sector       = EXCLUDED.sector,
-                market_cap   = EXCLUDED.market_cap,
-                updated_at   = NOW()
+                sector = EXCLUDED.sector,
+                market_cap = EXCLUDED.market_cap,
+                updated_at = NOW()
             RETURNING id
             """,
-            (
-                ticker,
-                info.get("longName")       or ticker,
-                info.get("sector")         or "Unknown",
-                info.get("marketCap"),
-            ),
+            (ticker, info.get("longName", ticker), info.get("sector", "Unknown"), info.get("marketCap")),
         )
-        asset_id = cur.fetchone()[0]
-
-    rows_written = 0
+        aid = cur.fetchone()[0]
+    written = 0
     with conn.cursor() as cur:
         for ts, row in hist.iterrows():
-            # ts is a timezone-aware pandas Timestamp. Convert to standard UTC datetime.
-            trade_ts = ts.to_pydatetime().astimezone(IST)
-
             cur.execute(
                 """
-                INSERT INTO price_history
-                    (asset_id, ticker, ts,
-                     open_price, high_price, low_price, close_price,
-                     volume, adj_close)
+                INSERT INTO price_history (asset_id, ticker, ts, open_price, high_price, low_price, close_price, volume, adj_close)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (ticker, ts) DO UPDATE SET
-                    open_price  = EXCLUDED.open_price,
-                    high_price  = EXCLUDED.high_price,
-                    low_price   = EXCLUDED.low_price,
-                    close_price = EXCLUDED.close_price,
-                    volume      = EXCLUDED.volume,
-                    adj_close   = EXCLUDED.adj_close
+                    open_price = EXCLUDED.open_price, high_price = EXCLUDED.high_price, low_price = EXCLUDED.low_price,
+                    close_price = EXCLUDED.close_price, volume = EXCLUDED.volume, adj_close = EXCLUDED.adj_close
                 """,
-                (
-                    asset_id,
-                    ticker,
-                    trade_ts,
-                    float(row["Open"]),
-                    float(row["High"]),
-                    float(row["Low"]),
-                    float(row["Close"]),
-                    int(row["Volume"]),
-                    float(row["Close"]),  # yfinance already adjusts Close
-                ),
+                (aid, ticker, ts.to_pydatetime().astimezone(IST), float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"]), int(row["Volume"]), float(row["Close"])),
             )
-            rows_written += 1
-
+            written += 1
     conn.commit()
-    logger.info("[%s] Upserted %d price rows.", ticker, rows_written)
-    return rows_written
+    return written
 
-
-# ------------------------------------------------------------------
-# Yahoo Finance: fetch news and store sentiment
-# ------------------------------------------------------------------
-
-def fetch_yfinance_news_sentiment(
-    ticker:   str,
-    analyzer: FinBERTAnalyzer,
-    conn:     psycopg.Connection,
-) -> int:
-    """
-    Fetch Yahoo Finance news for `ticker`, run FinBERT, store results.
-    Returns the number of NEW rows inserted.
-    """
-    logger.info("[%s] Fetching Yahoo Finance news …", ticker)
-    
-    def _get_news():
-        t = yf.Ticker(ticker)
-        return t.news
-        
-    news = with_exponential_backoff(_get_news, max_retries=3, base_delay=1.0)
-    
-    if not news:
-        logger.info("[%s] No news found.", ticker)
-        return 0
-
-    logger.info("[%s] Running FinBERT on %d news items …", ticker, len(news))
-
-    # Prepare texts: Title + Summary
-    texts = []
-    processed_news = []
-    for item in news:
-        content = item.get("content", {})
-        title = content.get("title", "")
-        summary = content.get("summary", "")
-        full_text = f"{title}. {summary}".strip()
-        if len(full_text) >= 15:
-            texts.append(full_text[:512])
-            processed_news.append(item)
-
-    if not texts:
-        return 0
-
-    sentiments = analyzer.analyze_batch(texts)
-
-    inserted = 0
+def ingest_news(ticker: str, model: FinBERT, conn: psycopg.Connection) -> int:
+    logger.info("[%s] ingest news", ticker)
+    news = retry(lambda: yf.Ticker(ticker).news)
+    if not news: return 0
+    texts, items = [], []
+    for n in news:
+        c = n.get("content", {})
+        txt = f"{c.get('title','')}. {c.get('summary','')}".strip()
+        if len(txt) >= 15:
+            texts.append(txt[:512])
+            items.append(n)
+    if not texts: return 0
+    scores = model.score_batch(texts)
+    new = 0
     with conn.cursor() as cur:
-        for item, text, s in zip(processed_news, texts, sentiments):
-            content = item.get("content", {})
-            source_id = item.get("id") or hashlib.md5(text.encode()).hexdigest()
-            
-            # Parse publication date
-            pub_date_str = content.get("pubDate")
-            if pub_date_str:
-                try:
-                    # Parse UTC string and convert to IST
-                    pub_date = datetime.fromisoformat(pub_date_str.replace("Z", "+00:00")).astimezone(IST)
-                except ValueError:
-                    pub_date = datetime.now(IST)
-            else:
-                pub_date = datetime.now(IST)
-
+        for it, tx, s in zip(items, texts, scores):
+            c = it.get("content", {})
+            sid = it.get("id") or hashlib.md5(tx.encode()).hexdigest()
+            dt_str = c.get("pubDate")
+            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).astimezone(IST) if dt_str else datetime.now(IST)
             cur.execute(
                 """
-                INSERT INTO sentiment_logs
-                    (ticker, source, source_id,
-                     raw_text, positive_score, negative_score,
-                     neutral_score, compound_score,
-                     author, post_url, created_at)
-                VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (source_id) DO NOTHING
-                RETURNING id
+                INSERT INTO sentiment_logs (ticker, source, source_id, raw_text, positive_score, negative_score, neutral_score, compound_score, author, post_url, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (source_id) DO NOTHING RETURNING id
                 """,
-                (
-                    ticker.upper(),
-                    "yfinance",
-                    source_id,
-                    text[:2000],
-                    s.positive,
-                    s.negative,
-                    s.neutral,
-                    s.compound,
-                    content.get("provider", {}).get("displayName", "Yahoo Finance"),
-                    content.get("canonicalUrl", {}).get("url"),
-                    pub_date,
-                ),
+                (ticker.upper(), "yfinance", sid, tx[:2000], s.positive, s.negative, s.neutral, s.compound, c.get("provider", {}).get("displayName", "Yahoo Finance"), c.get("canonicalUrl", {}).get("url"), dt),
             )
-            if cur.fetchone():
-                inserted += 1
-
+            if cur.fetchone(): new += 1
     conn.commit()
-    logger.info("[%s] Inserted %d new sentiment records.", ticker, inserted)
-    return inserted
+    return new
 
-
-# ------------------------------------------------------------------
-# Helper — torch device
-# ------------------------------------------------------------------
-
-def _get_device_id() -> int:
-    try:
-        torch = importlib.import_module("torch")
-        return 0 if torch.cuda.is_available() else -1
-    except ImportError:
-        return -1
-
-
-# ------------------------------------------------------------------
-# Main pipeline runner
-# ------------------------------------------------------------------
-
-def run_pipeline(tickers: list[str]) -> None:
-    analyzer = FinBERTAnalyzer()
-
-    with psycopg.connect(_DATABASE_URL) as conn:
-        for ticker in tickers:
-            logger.info("══ Processing %s ══", ticker)
-
-            try:
-                fetch_and_store_price_history(ticker, conn)
-            except Exception as exc:
-                logger.error("[%s] Price pipeline error: %s", ticker, exc)
-
-            try:
-                fetch_yfinance_news_sentiment(ticker, analyzer, conn)
-            except Exception as exc:
-                logger.error("[%s] Sentiment pipeline error: %s", ticker, exc)
-
+def run(tickers: list[str]) -> None:
+    model = FinBERT()
+    with psycopg.connect(_DB_URL) as conn:
+        for t in tickers:
+            logger.info("run: %s", t)
+            try: ingest_ohlcv(t, conn)
+            except Exception as e: logger.error("[%s] ohlcv err: %s", t, e)
+            try: ingest_news(t, model, conn)
+            except Exception as e: logger.error("[%s] news err: %s", t, e)
 
 if __name__ == "__main__":
     raw = os.getenv("TICKERS", "AAPL,TSLA,NVDA,MSFT,AMZN")
-    tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
-    run_pipeline(tickers)
+    run([t.strip().upper() for t in raw.split(",") if t.strip()])
