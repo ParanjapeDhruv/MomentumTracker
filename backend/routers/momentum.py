@@ -14,6 +14,7 @@ from datetime import date, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query
+from psycopg.rows import dict_row
 
 from ..database import get_db
 from ..schemas import DailyMomentumPoint, MomentumResponse, MomentumSummary
@@ -106,28 +107,34 @@ rolling_sentiment AS (
             ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
         )                  AS rolling_7d_mentions
     FROM sentiment_daily
-)
+),
 
 -- ── 4. Final join ────────────────────────────────────────────────
+joined_data AS (
+    SELECT
+        p.trade_date,
+        p.open_price  AS open,
+        p.high_price  AS high,
+        p.low_price   AS low,
+        p.close_price AS close,
+        p.volume,
+        COALESCE(p.pct_change,              0)  AS pct_change,
+        COALESCE(s.avg_compound,            0)  AS daily_sentiment,
+        COALESCE(s.rolling_7d_sentiment,    0)  AS rolling_7d_sentiment,
+        COALESCE(s.mention_count,           0)  AS mention_count,
+        COALESCE(s.rolling_7d_mentions,     0)  AS rolling_7d_mentions,
+        COALESCE(s.pos_count,               0)  AS positive_count,
+        COALESCE(s.neg_count,               0)  AS negative_count,
+        COALESCE(s.neu_count,               0)  AS neutral_count,
+        COALESCE(s.compound_stddev,         0)  AS sentiment_volatility
+    FROM      price_data      p
+    LEFT JOIN rolling_sentiment s ON p.trade_date = s.sentiment_date
+)
 SELECT
-    p.trade_date,
-    p.open_price,
-    p.high_price,
-    p.low_price,
-    p.close_price,
-    p.volume,
-    COALESCE(p.pct_change,              0)  AS pct_change,
-    COALESCE(s.avg_compound,            0)  AS daily_sentiment,
-    COALESCE(s.rolling_7d_sentiment,    0)  AS rolling_7d_sentiment,
-    COALESCE(s.mention_count,           0)  AS mention_count,
-    COALESCE(s.rolling_7d_mentions,     0)  AS rolling_7d_mentions,
-    COALESCE(s.pos_count,               0)  AS positive_count,
-    COALESCE(s.neg_count,               0)  AS negative_count,
-    COALESCE(s.neu_count,               0)  AS neutral_count,
-    COALESCE(s.compound_stddev,         0)  AS sentiment_volatility
-FROM      price_data      p
-LEFT JOIN rolling_sentiment s ON p.trade_date = s.sentiment_date
-ORDER BY  p.trade_date ASC
+    *,
+    COALESCE(ROUND(CORR(pct_change, daily_sentiment) OVER ()::NUMERIC, 5), 0) AS sentiment_price_correlation
+FROM joined_data
+ORDER BY trade_date ASC
 """
 
 
@@ -151,7 +158,7 @@ async def get_momentum(
 
     async with get_db() as conn:
         # ── Verify the ticker is registered ──────────────────────
-        async with conn.cursor() as cur:
+        async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 "SELECT id, company_name, sector FROM assets WHERE ticker = %s",
                 (ticker,),
@@ -165,13 +172,12 @@ async def get_momentum(
             )
 
         # ── Execute the composite query ───────────────────────────
-        async with conn.cursor() as cur:
+        async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 _MOMENTUM_SQL,
                 {"ticker": ticker, "start_date": _start, "end_date": _end},
             )
-            col_names = [desc[0] for desc in cur.description]
-            rows      = await cur.fetchall()
+            rows = await cur.fetchall()
 
     if not rows:
         raise HTTPException(
@@ -184,28 +190,7 @@ async def get_momentum(
         )
 
     # ── Deserialise rows → Pydantic models ────────────────────────
-    data_points: list[DailyMomentumPoint] = []
-    for row in rows:
-        r = dict(zip(col_names, row))
-        data_points.append(
-            DailyMomentumPoint(
-                trade_date=r["trade_date"],
-                open=float(r["open_price"]),
-                high=float(r["high_price"]),
-                low=float(r["low_price"]),
-                close=float(r["close_price"]),
-                volume=int(r["volume"]),
-                pct_change=float(r["pct_change"]),
-                daily_sentiment=float(r["daily_sentiment"]),
-                rolling_7d_sentiment=float(r["rolling_7d_sentiment"]),
-                mention_count=int(r["mention_count"]),
-                rolling_7d_mentions=int(r["rolling_7d_mentions"]),
-                positive_count=int(r["positive_count"]),
-                negative_count=int(r["negative_count"]),
-                neutral_count=int(r["neutral_count"]),
-                sentiment_volatility=float(r["sentiment_volatility"]),
-            )
-        )
+    data_points = [DailyMomentumPoint(**r) for r in rows]
 
     # ── Compute summary statistics ────────────────────────────────
     sentiment_series = [d.daily_sentiment for d in data_points if d.mention_count > 0]
@@ -213,8 +198,8 @@ async def get_momentum(
 
     summary = MomentumSummary(
         ticker=ticker,
-        company_name=asset_row[1],
-        sector=asset_row[2],
+        company_name=asset_row["company_name"],
+        sector=asset_row["sector"],
         period_start=_start,
         period_end=_end,
         avg_sentiment=(
@@ -227,35 +212,7 @@ async def get_momentum(
             if pct_changes else 0.0
         ),
         latest_close=data_points[-1].close if data_points else 0.0,
-        sentiment_price_correlation=_pearson(
-            [d.daily_sentiment for d in data_points],
-            [d.pct_change      for d in data_points],
-        ),
+        sentiment_price_correlation=float(rows[0]["sentiment_price_correlation"]),
     )
 
     return MomentumResponse(summary=summary, data=data_points)
-
-
-# ------------------------------------------------------------------
-# Helper — Pearson r without NumPy / SciPy dependency
-# ------------------------------------------------------------------
-
-def _pearson(x: list[float], y: list[float]) -> float:
-    """
-    Pure-Python Pearson correlation coefficient.
-    Returns 0.0 on degenerate input (n < 2, zero variance).
-    """
-    n = len(x)
-    if n < 2 or len(y) != n:
-        return 0.0
-
-    mean_x = sum(x) / n
-    mean_y = sum(y) / n
-
-    dx = [xi - mean_x for xi in x]
-    dy = [yi - mean_y for yi in y]
-
-    numerator = sum(a * b for a, b in zip(dx, dy))
-    denom     = math.sqrt(sum(a * a for a in dx)) * math.sqrt(sum(b * b for b in dy))
-
-    return round(numerator / denom, 5) if denom != 0.0 else 0.0

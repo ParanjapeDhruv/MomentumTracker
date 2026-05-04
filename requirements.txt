@@ -6,3 +6,9 @@ psycopg-pool
 uvicorn
 yfinance
 xgboost
+scikit-learn
+transformers
+torch
+httpx
+beautifulsoup4
+lxml

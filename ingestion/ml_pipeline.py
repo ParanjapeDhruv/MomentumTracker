@@ -48,11 +48,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 def train_and_predict(ticker: str, conn: psycopg.Connection):
     logger.info("Extracting data for %s", ticker)
     
-    # Ensure materialized view is updated for latest 5m intervals
-    with conn.cursor() as cur:
-        cur.execute("REFRESH MATERIALIZED VIEW interval_sentiment_agg;")
-        conn.commit()
-
     query = """
     SELECT
         p.ts,
@@ -71,6 +66,10 @@ def train_and_predict(ticker: str, conn: psycopg.Connection):
         rows = cur.fetchall()
         
     df = pd.DataFrame(rows, columns=columns)
+    
+    # Ensure numeric types (psycopg/Decimal → float)
+    for col in ['close_price', 'avg_compound']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
     
     if len(df) < 50:
         logger.warning("Not enough data to train for %s. Wait for more ingestion.", ticker)
@@ -144,7 +143,7 @@ def train_and_predict(ticker: str, conn: psycopg.Connection):
     logger.info("Upserted prediction for %s at %s", ticker, ts)
 
 def run_ml_pipeline():
-    raw = os.getenv("TICKERS", "AAPL,TSLA,NVDA,MSFT")
+    raw = os.getenv("TICKERS", "AAPL,TSLA,NVDA,MSFT,AMZN")
     tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
     
     with psycopg.connect(_DATABASE_URL) as conn:

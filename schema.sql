@@ -38,7 +38,6 @@ FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 -- ─── Phase 3: Intraday High-Frequency OHLCV Data ────────────────────
 
 CREATE TABLE IF NOT EXISTS price_history (
-    id          BIGSERIAL    PRIMARY KEY,
     asset_id    INTEGER      NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
     ticker      VARCHAR(10)  NOT NULL,
     ts          TIMESTAMPTZ  NOT NULL, -- Intraday timestamp (e.g., 5m intervals)
@@ -50,7 +49,7 @@ CREATE TABLE IF NOT EXISTS price_history (
     volume      BIGINT       NOT NULL DEFAULT 0,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT price_history_ticker_ts_uq  UNIQUE (ticker, ts),
+    CONSTRAINT price_history_ticker_ts_uq  PRIMARY KEY (ticker, ts),
     CONSTRAINT price_history_ohlc_sane CHECK (
         low_price  <= open_price  AND
         low_price  <= close_price AND
@@ -58,7 +57,22 @@ CREATE TABLE IF NOT EXISTS price_history (
         high_price >= open_price  AND
         high_price >= close_price
     )
-);
+) PARTITION BY RANGE (ts);
+
+-- Initial partitions
+CREATE TABLE IF NOT EXISTS price_history_y2026m03 PARTITION OF price_history
+    FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+
+CREATE TABLE IF NOT EXISTS price_history_y2026m04 PARTITION OF price_history
+    FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+
+CREATE TABLE IF NOT EXISTS price_history_y2026m05 PARTITION OF price_history
+    FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+
+CREATE TABLE IF NOT EXISTS price_history_y2026m06 PARTITION OF price_history
+    FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+
+CREATE TABLE IF NOT EXISTS price_history_default PARTITION OF price_history DEFAULT;
 
 CREATE INDEX IF NOT EXISTS idx_ph_ticker_ts_desc
     ON price_history (ticker, ts DESC);
@@ -110,7 +124,6 @@ CREATE INDEX IF NOT EXISTS idx_sl_ingested_at_brin
 CREATE INDEX IF NOT EXISTS idx_sl_source_ticker
     ON sentiment_logs (source, ticker);
 
-
 -- ─── Phase 2 & 3: Materialized View for Intraday Aggregation ──────────
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS interval_sentiment_agg AS
@@ -129,7 +142,23 @@ GROUP BY ticker, interval_ts
 WITH DATA;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_isa_ticker_ts
-    ON interval_sentiment_agg (ticker, interval_ts DESC);
+    ON interval_sentiment_agg (ticker, interval_ts);
+
+-- Automated Concurrent Refresh
+CREATE OR REPLACE FUNCTION refresh_sentiment_agg()
+RETURNS TRIGGER AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW CONCURRENTLY interval_sentiment_agg;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_refresh_sentiment_agg ON sentiment_logs;
+CREATE TRIGGER trg_refresh_sentiment_agg
+AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE
+ON sentiment_logs
+FOR EACH STATEMENT
+EXECUTE FUNCTION refresh_sentiment_agg();
 
 
 -- ─── Phase 2: O(1) Pre-Computed Predictions Table ─────────────────────

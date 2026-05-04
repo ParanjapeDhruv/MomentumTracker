@@ -1,0 +1,8 @@
+psql -d sentiment_tracker -f schema.sql  #database initialisation
+uvicorn backend.main:app --reload #fastapi
+cd frontend
+npm run dev #3 and 4 for frontend
+python -m ingestion.pipeline
+python -m ingestion.ml_pipeline #5 and 6 for pipelines
+if anything fails: $env:DATABASE_URL="postgresql://postgres:Dhruv%402006@localhost:5432/sentiment_tracker"
+then the required command

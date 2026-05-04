@@ -418,6 +418,6 @@ def run_pipeline(tickers: list[str]) -> None:
 
 
 if __name__ == "__main__":
-    raw = os.getenv("TICKERS", "AAPL,TSLA,NVDA,MSFT")
+    raw = os.getenv("TICKERS", "AAPL,TSLA,NVDA,MSFT,AMZN")
     tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
     run_pipeline(tickers)
