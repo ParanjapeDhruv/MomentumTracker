@@ -13,3 +13,7 @@ __pycache__/
 # Large model files (If you download FinBERT weights locally)
 *.bin
 *.pt
+
+.vscode/
+
+frontend/node_modules/
