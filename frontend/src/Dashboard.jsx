@@ -297,7 +297,7 @@ export default function Dashboard() {
               Sentiment Signal
             </span>
             <span className="text-xs font-mono text-ink-muted">
-              FinBERT · Reddit · 7D Rolling Avg
+              FinBERT · Yahoo Finance · 7D Rolling Avg
             </span>
           </div>
 
@@ -329,7 +329,7 @@ export default function Dashboard() {
         {/* Data quality footer */}
         {summary && (
           <p className="text-xxs font-mono text-ink-disabled text-right">
-            Data: yfinance (OHLCV) + Reddit/PRAW (sentiment) · NLP: ProsusAI/FinBERT ·
+            Data: yfinance (OHLCV + News) · NLP: ProsusAI/FinBERT ·
             Last updated: {new Date().toLocaleTimeString()}
           </p>
         )}

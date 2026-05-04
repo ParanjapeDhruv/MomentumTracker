@@ -96,8 +96,7 @@ CREATE TABLE IF NOT EXISTS sentiment_logs (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sl_source_id_dedup
-    ON sentiment_logs (source_id)
-    WHERE source_id IS NOT NULL;
+    ON sentiment_logs (source_id);
 
 CREATE INDEX IF NOT EXISTS idx_sl_ticker_created_asc
     ON sentiment_logs (ticker, created_at ASC);

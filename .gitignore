@@ -7,7 +7,7 @@ env/
 __pycache__/
 *.pyc
 
-# Environment variables (To keep your Reddit Secret safe)
+# Environment variables
 .env
 
 # Large model files (If you download FinBERT weights locally)

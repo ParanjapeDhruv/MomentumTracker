@@ -3,11 +3,9 @@ ingestion/pipeline.py — Standalone data-ingestion script.
 
 Responsibilities:
   1. Fetch OHLCV history via yfinance  →  price_history table
-  2. Fetch Reddit posts via PRAW        →  run FinBERT  →  sentiment_logs table
+  2. Fetch Yahoo Finance News          →  run FinBERT  →  sentiment_logs table
 
 Rate-limit handling strategy:
-  • PRAW:    Reddit's API returns a Retry-After header.  PRAW exposes this in
-             RedditAPIException.  We parse it and sleep exactly that long + 5s.
   • yfinance: No hard rate limit, but we add a polite inter-request delay and
               retry with exponential back-off on HTTP 429.
   • FinBERT: Local inference — no external rate limit, but we batch inputs to
@@ -28,7 +26,6 @@ from datetime import datetime, timezone
 from typing import Iterator
 
 import psycopg
-import praw
 import yfinance as yf
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
@@ -87,7 +84,7 @@ class FinBERTAnalyzer:
             task="text-classification",
             model=model,
             tokenizer=tokenizer,
-            return_all_scores=True,
+            top_k=None,  # Return all scores
             truncation=True,
             max_length=self.MAX_TOKENS,
             # device=0 for GPU; -1 forces CPU.  Auto-detect:
@@ -97,19 +94,12 @@ class FinBERTAnalyzer:
 
     # ------------------------------------------------------------------
 
-    def analyze(self, text: str) -> SentimentResult:
-        """Single-item inference.  Returns neutral(0) for empty/short text."""
-        text = text.strip()
-        if len(text) < 15:
-            return SentimentResult(0.0, 0.0, 1.0, 0.0)
-
-        try:
-            raw: list[dict] = self._pipe(text)[0]
-        except Exception as exc:
-            logger.warning("FinBERT inference failed: %s", exc)
-            return SentimentResult(0.0, 0.0, 1.0, 0.0)
-
-        scores = {item["label"].lower(): float(item["score"]) for item in raw}
+    def _parse_scores(self, raw_output: list[dict] | dict) -> SentimentResult:
+        """Helper to extract scores from various pipeline output formats."""
+        # If output is a single dict (some pipeline configs), wrap it
+        items = raw_output if isinstance(raw_output, list) else [raw_output]
+        
+        scores = {item["label"].lower(): float(item["score"]) for item in items}
         pos = scores.get("positive", 0.0)
         neg = scores.get("negative", 0.0)
         neu = scores.get("neutral",  0.0)
@@ -121,33 +111,38 @@ class FinBERTAnalyzer:
             compound=round(pos - neg, 5),
         )
 
+    def analyze(self, text: str) -> SentimentResult:
+        """Single-item inference.  Returns neutral(0) for empty/short text."""
+        text = text.strip()
+        if len(text) < 15:
+            return SentimentResult(0.0, 0.0, 1.0, 0.0)
+
+        try:
+            raw = self._pipe(text)
+            # Pipeline for single text usually returns [[{...}, ...]] or [{...}, ...]
+            return self._parse_scores(raw[0] if isinstance(raw, list) else raw)
+        except Exception as exc:
+            logger.warning("FinBERT inference failed: %s", exc)
+            return SentimentResult(0.0, 0.0, 1.0, 0.0)
+
     def analyze_batch(self, texts: list[str]) -> list[SentimentResult]:
         """
         Batch inference.  Skips empty texts and returns neutral placeholders.
         Falls back to single-item inference on any batch error.
         """
-        results: list[SentimentResult] = []
+        if not texts:
+            return []
+            
         try:
             raw_batch = self._pipe(
                 [t[:2000] for t in texts],  # hard-cap chars to avoid OOM
                 batch_size=16,
             )
-            for raw in raw_batch:
-                scores = {item["label"].lower(): float(item["score"]) for item in raw}
-                pos = scores.get("positive", 0.0)
-                neg = scores.get("negative", 0.0)
-                neu = scores.get("neutral",  0.0)
-                results.append(SentimentResult(
-                    positive=round(pos, 5),
-                    negative=round(neg, 5),
-                    neutral= round(neu, 5),
-                    compound=round(pos - neg, 5),
-                ))
+            # raw_batch is usually [[{...}, ...], ...]
+            return [self._parse_scores(raw) for raw in raw_batch]
         except Exception as exc:
             logger.warning("Batch inference failed (%s), falling back to single.", exc)
-            results = [self.analyze(t) for t in texts]
-
-        return results
+            return [self.analyze(t) for t in texts]
 
 
 # ------------------------------------------------------------------
@@ -292,120 +287,64 @@ def fetch_and_store_price_history(
 
 
 # ------------------------------------------------------------------
-# PRAW: fetch Reddit posts and store sentiment
+# Yahoo Finance: fetch news and store sentiment
 # ------------------------------------------------------------------
 
-def _build_reddit_client() -> praw.Reddit:
-    for key in ("REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"):
-        if not os.environ.get(key):
-            raise EnvironmentError(
-                f"Missing required env var: {key}. "
-                "Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET."
-            )
-
-    return praw.Reddit(
-        client_id=os.environ["REDDIT_CLIENT_ID"],
-        client_secret=os.environ["REDDIT_CLIENT_SECRET"],
-        user_agent=os.environ.get(
-            "REDDIT_USER_AGENT",
-            "script:sentiment_tracker:v1.0 (by u/your_username)",
-        ),
-        # PRAW will block and wait up to ratelimit_seconds before raising.
-        ratelimit_seconds=600,
-    )
-
-
-def _iter_reddit_posts(
-    reddit:   praw.Reddit,
+def fetch_yfinance_news_sentiment(
     ticker:   str,
-    subreddits: list[str],
-    limit:    int,
-    limiter:  RateLimiter,
-) -> Iterator[praw.models.Submission]:
-    """Yield posts matching ticker from each subreddit, with rate limiting."""
-    query = f"${ticker} OR {ticker}"
-
-    for sub_name in subreddits:
-        logger.info("[%s] Searching r/%s …", ticker, sub_name)
-        try:
-            limiter.wait()
-            subreddit = reddit.subreddit(sub_name)
-            posts = list(
-                subreddit.search(query, limit=limit, time_filter="week", sort="relevance")
-            )
-            for post in posts:
-                yield post
-
-        except praw.exceptions.RedditAPIException as exc:
-            _handle_reddit_rate_limit(exc)
-
-        except Exception as exc:
-            logger.error("[%s] r/%s fetch error: %s", ticker, sub_name, exc)
-            continue
-
-
-def _handle_reddit_rate_limit(exc: praw.exceptions.RedditAPIException) -> None:
-    """Parse Reddit's Retry-After from the exception and sleep accordingly."""
-    for error in exc.items:
-        if error.error_type == "RATELIMIT":
-            # Reddit's message is typically: "Take a break for N minutes …"
-            # PRAW also exposes the retry_after attribute in newer versions.
-            retry_after = getattr(error, "retry_after", None)
-            if retry_after is not None:
-                wait = float(retry_after) + 5.0
-            else:
-                # Best-effort parse from message string
-                try:
-                    parts = error.message.lower().split("minute")
-                    wait  = float(parts[0].strip().split()[-1]) * 60 + 10
-                except (IndexError, ValueError):
-                    wait = 120.0  # fallback: 2 minutes
-
-            logger.warning("Reddit rate limit hit. Sleeping %.0fs …", wait)
-            time.sleep(wait)
-        else:
-            logger.error("Reddit API error [%s]: %s", error.error_type, error.message)
-
-
-def fetch_reddit_sentiment(
-    ticker:     str,
-    analyzer:   FinBERTAnalyzer,
-    conn:       psycopg.Connection,
-    subreddits: list[str] | None = None,
-    limit:      int = 75,
+    analyzer: FinBERTAnalyzer,
+    conn:     psycopg.Connection,
 ) -> int:
     """
-    Fetch Reddit posts mentioning `ticker`, run FinBERT, store results.
-    Returns the number of NEW rows inserted (duplicates are skipped).
+    Fetch Yahoo Finance news for `ticker`, run FinBERT, store results.
+    Returns the number of NEW rows inserted.
     """
-    if subreddits is None:
-        subreddits = ["wallstreetbets", "stocks", "investing", "SecurityAnalysis"]
-
-    reddit  = _build_reddit_client()
-    limiter = RateLimiter(calls_per_minute=25)
-    posts   = list(_iter_reddit_posts(reddit, ticker, subreddits, limit, limiter))
-
-    if not posts:
-        logger.info("[%s] No Reddit posts found.", ticker)
+    logger.info("[%s] Fetching Yahoo Finance news …", ticker)
+    
+    def _get_news():
+        t = yf.Ticker(ticker)
+        return t.news
+        
+    news = with_exponential_backoff(_get_news, max_retries=3, base_delay=1.0)
+    
+    if not news:
+        logger.info("[%s] No news found.", ticker)
         return 0
 
-    logger.info("[%s] Running FinBERT on %d posts …", ticker, len(posts))
+    logger.info("[%s] Running FinBERT on %d news items …", ticker, len(news))
 
-    # Build text list; truncate to 512 chars to stay within FinBERT token budget.
-    texts = [
-        f"{p.title}. {p.selftext}"[:512].strip()
-        for p in posts
-    ]
+    # Prepare texts: Title + Summary
+    texts = []
+    processed_news = []
+    for item in news:
+        content = item.get("content", {})
+        title = content.get("title", "")
+        summary = content.get("summary", "")
+        full_text = f"{title}. {summary}".strip()
+        if len(full_text) >= 15:
+            texts.append(full_text[:512])
+            processed_news.append(item)
+
+    if not texts:
+        return 0
+
     sentiments = analyzer.analyze_batch(texts)
 
     inserted = 0
     with conn.cursor() as cur:
-        for post, text, s in zip(posts, texts, sentiments):
-            if len(text) < 15:
-                continue
-
-            source_id    = hashlib.md5(f"reddit_{post.id}".encode()).hexdigest()
-            post_created = datetime.fromtimestamp(post.created_utc, tz=timezone.utc)
+        for item, text, s in zip(processed_news, texts, sentiments):
+            content = item.get("content", {})
+            source_id = item.get("id") or hashlib.md5(text.encode()).hexdigest()
+            
+            # Parse publication date
+            pub_date_str = content.get("pubDate")
+            if pub_date_str:
+                try:
+                    pub_date = datetime.fromisoformat(pub_date_str.replace("Z", "+00:00"))
+                except ValueError:
+                    pub_date = datetime.now(timezone.utc)
+            else:
+                pub_date = datetime.now(timezone.utc)
 
             cur.execute(
                 """
@@ -421,16 +360,16 @@ def fetch_reddit_sentiment(
                 """,
                 (
                     ticker.upper(),
-                    "reddit",
+                    "yfinance",
                     source_id,
                     text[:2000],
                     s.positive,
                     s.negative,
                     s.neutral,
                     s.compound,
-                    str(post.author) if post.author else "deleted",
-                    f"https://reddit.com{post.permalink}",
-                    post_created,
+                    content.get("provider", {}).get("displayName", "Yahoo Finance"),
+                    content.get("canonicalUrl", {}).get("url"),
+                    pub_date,
                 ),
             )
             if cur.fetchone():
@@ -470,7 +409,7 @@ def run_pipeline(tickers: list[str]) -> None:
                 logger.error("[%s] Price pipeline error: %s", ticker, exc)
 
             try:
-                fetch_reddit_sentiment(ticker, analyzer, conn)
+                fetch_yfinance_news_sentiment(ticker, analyzer, conn)
             except Exception as exc:
                 logger.error("[%s] Sentiment pipeline error: %s", ticker, exc)
 
