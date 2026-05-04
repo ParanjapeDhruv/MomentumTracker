@@ -22,12 +22,14 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Iterator
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import psycopg
 import yfinance as yf
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+
+IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -250,7 +252,7 @@ def fetch_and_store_price_history(
     with conn.cursor() as cur:
         for ts, row in hist.iterrows():
             # ts is a timezone-aware pandas Timestamp. Convert to standard UTC datetime.
-            trade_ts = ts.to_pydatetime().astimezone(timezone.utc)
+            trade_ts = ts.to_pydatetime().astimezone(IST)
 
             cur.execute(
                 """
@@ -340,11 +342,12 @@ def fetch_yfinance_news_sentiment(
             pub_date_str = content.get("pubDate")
             if pub_date_str:
                 try:
-                    pub_date = datetime.fromisoformat(pub_date_str.replace("Z", "+00:00"))
+                    # Parse UTC string and convert to IST
+                    pub_date = datetime.fromisoformat(pub_date_str.replace("Z", "+00:00")).astimezone(IST)
                 except ValueError:
-                    pub_date = datetime.now(timezone.utc)
+                    pub_date = datetime.now(IST)
             else:
-                pub_date = datetime.now(timezone.utc)
+                pub_date = datetime.now(IST)
 
             cur.execute(
                 """

@@ -3,6 +3,8 @@
 -- Phase 3 Refactor: Intraday Support & Pre-computed Predictions
 -- ============================================================
 
+SET timezone = 'Asia/Kolkata';
+
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 CREATE TABLE IF NOT EXISTS assets (
@@ -115,7 +117,7 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS interval_sentiment_agg AS
 SELECT
     ticker,
     -- Align to 5-minute intervals
-    to_timestamp(floor((extract('epoch' from created_at) / 300 )) * 300) AT TIME ZONE 'UTC' AS interval_ts,
+    to_timestamp(floor((extract('epoch' from created_at) / 300 )) * 300) AT TIME ZONE 'Asia/Kolkata' AS interval_ts,
     COUNT(*)                                      AS mention_count,
     ROUND(AVG(compound_score)::NUMERIC, 5)        AS avg_compound,
     ROUND(STDDEV(compound_score)::NUMERIC, 5)     AS compound_stddev,

@@ -34,7 +34,7 @@ WITH
 -- ── 1. Aggregate intraday price to daily OHLCV ──────────────────
 daily_price_raw AS (
     SELECT
-        DATE(ts AT TIME ZONE 'UTC') AS trade_date,
+        DATE(ts AT TIME ZONE 'Asia/Kolkata') AS trade_date,
         (array_agg(open_price ORDER BY ts ASC))[1] AS open_price,
         MAX(high_price) AS high_price,
         MIN(low_price) AS low_price,
@@ -44,7 +44,7 @@ daily_price_raw AS (
     WHERE ticker = %(ticker)s
       AND ts >= %(start_date)s::TIMESTAMPTZ
       AND ts < (%(end_date)s::DATE + INTERVAL '1 day')::TIMESTAMPTZ
-    GROUP BY DATE(ts AT TIME ZONE 'UTC')
+    GROUP BY DATE(ts AT TIME ZONE 'Asia/Kolkata')
 ),
 
 price_data AS (
@@ -70,7 +70,7 @@ price_data AS (
 -- ── 2. Daily sentiment aggregates ───────────────────────────────
 sentiment_daily AS (
     SELECT
-        DATE(created_at AT TIME ZONE 'UTC')                              AS sentiment_date,
+        DATE(created_at AT TIME ZONE 'Asia/Kolkata')                              AS sentiment_date,
         COUNT(*)                                                          AS mention_count,
         ROUND(AVG(compound_score)::NUMERIC,   5)                         AS avg_compound,
         ROUND(STDDEV(compound_score)::NUMERIC, 5)                        AS compound_stddev,
@@ -81,7 +81,7 @@ sentiment_daily AS (
     WHERE ticker     = %(ticker)s
       AND created_at >= %(start_date)s::TIMESTAMPTZ
       AND created_at <  (%(end_date)s::DATE + INTERVAL '1 day')::TIMESTAMPTZ
-    GROUP BY DATE(created_at AT TIME ZONE 'UTC')
+    GROUP BY DATE(created_at AT TIME ZONE 'Asia/Kolkata')
 ),
 
 -- ── 3. 7-day rolling windows on sentiment ───────────────────────
