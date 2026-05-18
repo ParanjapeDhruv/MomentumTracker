@@ -1,4 +1,4 @@
-# Virtual Environment (The cause of your 100MB error)
+# Virtual Environment
 .venv312/
 venv/
 env/
@@ -10,7 +10,7 @@ __pycache__/
 # Environment variables
 .env
 
-# Large model files (If you download FinBERT weights locally)
+# Large model files
 *.bin
 *.pt
 
